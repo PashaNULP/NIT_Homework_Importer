@@ -1,0 +1,2 @@
+-r requirements_nit.txt
+nicegui==3.18.0
