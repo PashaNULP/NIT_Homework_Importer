@@ -38,14 +38,18 @@ def write_secure_backup(payload: dict[str, Any], directory: Path, prefix: str) -
     fd, temporary = tempfile.mkstemp(prefix=".nit2_", suffix=".tmp", dir=directory)
     temporary_path = Path(temporary)
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(document, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_path, path)
-        os.chmod(path, 0o600)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         verify_backup(path)
         return path
     except Exception:

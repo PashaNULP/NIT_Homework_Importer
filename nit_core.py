@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -29,6 +29,7 @@ from nit_homework_v2 import (
     PlannedChange,
     collect_absence_reminders,
     delete_keychain_session,
+    get_my_permissions,
     load_keychain_session,
     load_excel_rows,
     login_session_with_password,
@@ -218,6 +219,63 @@ def connect_with_password(
     return context
 
 
+def discover_user_config(
+    session: dict[str, Any],
+    preferred_school_id: str | None = None,
+) -> NitUserConfig:
+    """Визначає userId і школу так само, як офіційний вебклієнт НІТ."""
+    token = str(session.get("access_token") or "").strip()
+    profile = get_my_permissions(token)
+    user_id = str(profile.get("userId") or "").strip()
+    permissions = profile.get("permissions")
+    if not user_id or not isinstance(permissions, list):
+        raise NitError("НІТ не повернув userId або список доступних шкіл.")
+
+    school_ids: list[str] = []
+    for item in permissions:
+        if not isinstance(item, dict) or not item.get("active"):
+            continue
+        if str(item.get("forUserId") or "").strip() != user_id:
+            continue
+        school_id = str(item.get("schoolId") or "").strip()
+        if school_id and school_id != "0" and school_id not in school_ids:
+            school_ids.append(school_id)
+
+    preferred = str(preferred_school_id or "").strip()
+    if preferred:
+        if preferred not in school_ids:
+            raise NitError(
+                "Цей обліковий запис не має активного доступу до школи, "
+                "для якої налаштовано NIT²."
+            )
+        selected_school = preferred
+    elif len(school_ids) == 1:
+        selected_school = school_ids[0]
+    elif not school_ids:
+        raise NitError("Для цього облікового запису НІТ не знайдено активної школи.")
+    else:
+        raise NitError(
+            "Обліковий запис має доступ до кількох шкіл. "
+            "Адміністратор NIT² має вказати NIT_SCHOOL_ID."
+        )
+    return NitUserConfig(selected_school, user_id, profile="web")
+
+
+def connect_user_with_password(
+    username: str,
+    password: str,
+    session_store: SessionStore,
+    preferred_school_id: str | None = None,
+) -> AuthContext:
+    """Окремий вхід вебкористувача без Keychain і спільного кешу токенів."""
+    session = login_session_with_password(username, password)
+    config = discover_user_config(session, preferred_school_id)
+    session_store.save(session)
+    context = _context_from_session(session, config, session_store, False)
+    context.session_saved = True
+    return context
+
+
 def refresh_auth_context(context: AuthContext, min_validity_seconds: int = 300) -> bool:
     """Заздалегідь поновлює сесію і підміняє token в чинному HTTP-клієнті."""
     config = context.user_config
@@ -241,6 +299,105 @@ def refresh_auth_context(context: AuthContext, min_validity_seconds: int = 300) 
         context.session = dict(refreshed)
         context.client.set_access_token(str(refreshed.get("access_token") or ""))
     return True
+
+
+def build_all_teachers_schedule(
+    client: NitClient,
+    week_start: date,
+) -> dict[str, Any]:
+    """Формує безпечний JSON-об'єкт тижневого розкладу всіх учителів.
+
+    Довідник НІТ також містить телефони, email і дати народження. Вони навмисно
+    не копіюються до експорту: залишаються лише ім'я та дані уроків.
+    """
+    start_day = week_start - timedelta(days=week_start.weekday())
+    end_day = start_day + timedelta(days=6)
+    raw_teachers = client.get_school_teachers(include_inactive=False)
+    teachers: dict[str, dict[str, Any]] = {}
+    for raw in raw_teachers:
+        teacher_id = str(raw.get("id") or "").strip()
+        if not teacher_id or not raw.get("isActive", True):
+            continue
+        teachers[teacher_id] = {
+            "id": teacher_id,
+            "name": str(raw.get("fullName") or "").strip(),
+            "lessons": [],
+        }
+
+    rows = client.get_school_journal_days(start_day, end_day, list(teachers))
+    seen: set[str] = set()
+    for raw in rows:
+        nested = raw.get("journalTeacher")
+        nested = nested if isinstance(nested, dict) else {}
+        teacher_id = str(
+            raw.get("journalTeacherId") or nested.get("id") or ""
+        ).strip()
+        if not teacher_id:
+            continue
+        if teacher_id not in teachers:
+            teachers[teacher_id] = {
+                "id": teacher_id,
+                "name": str(
+                    nested.get("fullName")
+                    or raw.get("journalTeacherShortName")
+                    or ""
+                ).strip(),
+                "lessons": [],
+            }
+        row_id = str(raw.get("id") or "").strip()
+        unique_key = row_id or "|".join(
+            str(raw.get(field) or "")
+            for field in ("date", "lesson", "journalId", "classId", "subjectId")
+        )
+        if unique_key in seen:
+            continue
+        seen.add(unique_key)
+        lesson_value = raw.get("lesson")
+        try:
+            lesson_number: int | float | str = float(lesson_value)
+            if lesson_number.is_integer():
+                lesson_number = int(lesson_number)
+        except (TypeError, ValueError):
+            lesson_number = str(lesson_value or "")
+        teachers[teacher_id]["lessons"].append(
+            {
+                "id": row_id or None,
+                "date": str(raw.get("date") or "")[:10],
+                "lesson": lesson_number,
+                "classId": raw.get("classId"),
+                "className": raw.get("className"),
+                "subjectId": raw.get("subjectId"),
+                "subject": raw.get("subject"),
+                "classroom": raw.get("classroom"),
+                "journalId": raw.get("journalId"),
+                "isReplacement": bool(raw.get("replace")),
+            }
+        )
+
+    teacher_rows = sorted(
+        teachers.values(),
+        key=lambda item: (str(item.get("name") or "").casefold(), item["id"]),
+    )
+    for teacher in teacher_rows:
+        teacher["lessons"].sort(
+            key=lambda item: (
+                item["date"],
+                item["lesson"] if isinstance(item["lesson"], (int, float)) else 999,
+                str(item["className"] or ""),
+            )
+        )
+    return {
+        "schema": "nit2.teacher-schedules.v1",
+        "generatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "weekStart": start_day.isoformat(),
+        "weekEnd": end_day.isoformat(),
+        "summary": {
+            "teachers": len(teacher_rows),
+            "teachersWithLessons": sum(bool(item["lessons"]) for item in teacher_rows),
+            "lessons": sum(len(item["lessons"]) for item in teacher_rows),
+        },
+        "teachers": teacher_rows,
+    }
 
 
 def load_journal_report(
@@ -662,8 +819,11 @@ __all__ = [
     "NitError",
     "connect_with_password",
     "connect_with_saved_session",
+    "connect_user_with_password",
+    "discover_user_config",
     "apply_absence_reminders",
     "apply_import_preview",
+    "build_all_teachers_schedule",
     "load_absence_reminders",
     "load_calendar_reports",
     "load_journal_report",

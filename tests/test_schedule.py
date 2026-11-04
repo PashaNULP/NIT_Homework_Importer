@@ -7,6 +7,7 @@ from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
+from nit_core import build_all_teachers_schedule
 from nit_homework_v2 import NitClient
 
 from nit_schedule import (
@@ -29,6 +30,42 @@ def payload(days):
 
 
 class ScheduleNormalizationTests(unittest.TestCase):
+    def test_all_teacher_export_omits_private_directory_fields(self):
+        client = Mock()
+        client.get_school_teachers.return_value = [
+            {
+                "id": "t1",
+                "fullName": "Учитель Один",
+                "isActive": True,
+                "phoneNumber": "+380000000000",
+                "email": "private@example.invalid",
+                "birthDay": "1990-01-01",
+            },
+            {"id": "t2", "fullName": "Учитель Два", "isActive": True},
+        ]
+        client.get_school_journal_days.return_value = [
+            {
+                "id": "d1",
+                "date": "2026-11-03T00:00:00Z",
+                "lesson": 2.0,
+                "journalTeacherId": "t1",
+                "classId": "c1",
+                "className": "7-А",
+                "subjectId": "s1",
+                "subject": "Фізика",
+                "classroom": "12",
+                "journalId": "j1",
+            }
+        ]
+        result = build_all_teachers_schedule(client, date(2026, 11, 4))
+        self.assertEqual(result["weekStart"], "2026-11-02")
+        self.assertEqual(result["summary"], {"teachers": 2, "teachersWithLessons": 1, "lessons": 1})
+        encoded = str(result)
+        self.assertNotIn("private@example.invalid", encoded)
+        self.assertNotIn("+380000000000", encoded)
+        self.assertNotIn("1990-01-01", encoded)
+        self.assertEqual(result["teachers"][1]["lessons"][0]["lesson"], 2)
+
     def test_teacher_diary_uses_confirmed_english_date_format(self):
         client = NitClient("synthetic", "school", "user", "test")
         response = object()

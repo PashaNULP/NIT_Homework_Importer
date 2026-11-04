@@ -7,7 +7,9 @@ Manager без змін бізнес-логіки.
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any, Callable, Protocol
 
 
@@ -53,3 +55,30 @@ class FunctionSessionStore:
 
     def delete(self) -> bool:
         return self._delete()
+
+
+class MemorySessionStore:
+    """Потокобезпечне сховище OAuth-сесії лише в пам'яті процесу.
+
+    Використовується вебсервером, щоб токени різних браузерів не потрапляли
+    до спільного Keychain або на диск. Після перезапуску сервера всі входи
+    навмисно завершуються.
+    """
+
+    def __init__(self) -> None:
+        self._session: dict[str, Any] | None = None
+        self._lock = RLock()
+
+    def load(self) -> dict[str, Any] | None:
+        with self._lock:
+            return deepcopy(self._session)
+
+    def save(self, session: dict[str, Any]) -> None:
+        with self._lock:
+            self._session = deepcopy(session)
+
+    def delete(self) -> bool:
+        with self._lock:
+            existed = self._session is not None
+            self._session = None
+            return existed

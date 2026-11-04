@@ -7,6 +7,7 @@ __pycache__/
 backups/
 .checkpoints/
 .nit2_data/
+.nicegui/
 nit_*backup*.json
 *.xlsx
 *.har
@@ -14,5 +15,6 @@ nit_*backup*.json
 Pasted text.txt
 nit_config.local.json
 *.session.json
+розклад_усіх_вчителів_*.json
 .env
 .env.*

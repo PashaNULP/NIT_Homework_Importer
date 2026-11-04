@@ -11,9 +11,15 @@ from unittest.mock import patch
 from openpyxl import Workbook
 
 import nit_homework_v2
-from nit_auth import FunctionSessionStore, NitUserConfig
+from nit_auth import FunctionSessionStore, MemorySessionStore, NitUserConfig
 from nit_backup import verify_backup, write_secure_backup
-from nit_core import AuthContext, connect_with_password, connect_with_saved_session, refresh_auth_context
+from nit_core import (
+    AuthContext,
+    connect_with_password,
+    connect_with_saved_session,
+    discover_user_config,
+    refresh_auth_context,
+)
 from nit_homework_v2 import ExcelRow, NitError, load_excel_rows, match_rows_to_lessons, valid_or_refreshed_session
 
 
@@ -38,6 +44,57 @@ class BackupTests(unittest.TestCase):
 
 
 class AuthTests(unittest.TestCase):
+    def test_memory_session_stores_are_isolated_and_return_copies(self):
+        first = MemorySessionStore()
+        second = MemorySessionStore()
+        source = {"access_token": "first", "nested": {"value": 1}}
+        first.save(source)
+        source["nested"]["value"] = 2
+        loaded = first.load()
+        self.assertEqual(loaded, {"access_token": "first", "nested": {"value": 1}})
+        loaded["nested"]["value"] = 3
+        self.assertEqual(first.load()["nested"]["value"], 1)
+        self.assertIsNone(second.load())
+        self.assertTrue(first.delete())
+        self.assertFalse(first.delete())
+
+    def test_user_config_is_discovered_for_configured_school(self):
+        response = {
+            "userId": "teacher-2",
+            "permissions": [
+                {
+                    "active": True,
+                    "forUserId": "teacher-2",
+                    "schoolId": "school-a",
+                },
+                {
+                    "active": True,
+                    "forUserId": "someone-else",
+                    "schoolId": "school-b",
+                },
+            ],
+        }
+        with patch("nit_core.get_my_permissions", return_value=response):
+            config = discover_user_config({"access_token": "token"}, "school-a")
+        self.assertEqual((config.school_id, config.user_id), ("school-a", "teacher-2"))
+
+    def test_user_without_configured_school_is_rejected(self):
+        response = {
+            "userId": "teacher-2",
+            "permissions": [
+                {
+                    "active": True,
+                    "forUserId": "teacher-2",
+                    "schoolId": "another-school",
+                }
+            ],
+        }
+        with (
+            patch("nit_core.get_my_permissions", return_value=response),
+            self.assertRaises(NitError),
+        ):
+            discover_user_config({"access_token": "token"}, "school-a")
+
     def test_valid_session_is_not_refreshed(self):
         session = {"access_token": "token", "refresh_token": "refresh", "expires_at": 99999999999}
         with patch("nit_homework_v2.refresh_oauth_session") as refresh:

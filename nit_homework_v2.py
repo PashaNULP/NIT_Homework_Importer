@@ -355,6 +355,44 @@ def login_session_with_password(username: str, password: str, timeout: int = 30)
     )
 
 
+def get_my_permissions(access_token: str, timeout: int = 30) -> dict[str, Any]:
+    """Отримує власний userId і доступні школи без контекстних X-NIT заголовків."""
+    token = compact(access_token)
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token:
+        raise NitError("НІТ не надав access token для визначення користувача.")
+    try:
+        response = requests.get(
+            f"{API_BASE}/users/my-permissions",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+                "Origin": APP_ORIGIN,
+                "Referer": f"{APP_ORIGIN}/",
+                "X-NIT-CLIENT": "web",
+                "X-NIT-CLIENT-VERSION": DEFAULT_CLIENT_VERSION,
+                "X-NIT-LOCALE": "uk",
+            },
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise NitError(f"Не вдалося визначити профіль користувача НІТ: {exc}") from exc
+    if response.status_code in (401, 403):
+        raise NitError("НІТ не дозволив отримати профіль поточного користувача.")
+    if not response.ok:
+        raise NitError(
+            f"НІТ повернув HTTP {response.status_code} під час визначення профілю."
+        )
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise NitError("НІТ повернув невідому відповідь профілю користувача.") from exc
+    if not isinstance(data, dict):
+        raise NitError("У відповіді НІТ немає профілю користувача.")
+    return data
+
+
 def login_with_password(username: str, password: str, timeout: int = 30) -> str:
     """Сумісна обгортка, яка повертає лише access token."""
     return str(login_session_with_password(username, password, timeout)["access_token"])
@@ -851,6 +889,73 @@ class NitClient:
         if not clean:
             raise NitError("НІТ не надав access token після поновлення сесії")
         self.session.headers["Authorization"] = f"Bearer {clean}"
+
+    def get_school_teachers(self, include_inactive: bool = False) -> list[dict[str, Any]]:
+        """Повертає довідник учителів школи без зміни будь-яких даних."""
+        r = self.session.get(
+            f"{API_BASE}/journals/teachers",
+            params={"includeInactive": str(include_inactive).lower()},
+            headers={"Alias": "journal-teachers"},
+            timeout=self.timeout,
+        )
+        data = self._handle(r, "Отримання списку вчителів")
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise NitError("НІТ повернув невідомий формат списку вчителів")
+        return [item for item in data["data"] if isinstance(item, dict)]
+
+    def get_school_journal_days(
+        self,
+        start_day: date,
+        end_day: date,
+        teacher_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """Читає уроки вибраних учителів за діапазон дат із пагінацією."""
+        if end_day < start_day:
+            raise NitError("Кінцева дата розкладу не може бути раніше початкової")
+        ids = [str(item).strip() for item in teacher_ids if str(item).strip()]
+        if not ids:
+            return []
+
+        take = 1000
+        skip = 0
+        result: list[dict[str, Any]] = []
+        while True:
+            params = {
+                "take": str(take),
+                "skip": str(skip),
+                "noTotal": "false",
+                "filter[logic]": "and",
+                "filter[filters][0][field]": "date",
+                "filter[filters][0][operator]": "gte",
+                "filter[filters][0][value]": start_day.isoformat(),
+                "filter[filters][1][field]": "date",
+                "filter[filters][1][operator]": "lte",
+                "filter[filters][1][value]": end_day.isoformat(),
+                "filter[filters][2][field]": "type",
+                "filter[filters][2][operator]": "eq",
+                "filter[filters][2][value]": "0",
+                "filter[filters][3][field]": "journalTeacher.id",
+                "filter[filters][3][operator]": "in",
+                "filter[filters][3][value]": ",".join(ids),
+            }
+            r = self.session.get(
+                f"{API_BASE}/journal-days",
+                params=params,
+                headers={"Alias": "journal-days-all"},
+                timeout=max(self.timeout, 60),
+            )
+            data = self._handle(r, "Отримання розкладу всіх учителів")
+            if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                raise NitError("НІТ повернув невідомий формат загального розкладу")
+            batch = [item for item in data["data"] if isinstance(item, dict)]
+            result.extend(batch)
+            total = data.get("total")
+            if len(batch) < take or (isinstance(total, int) and len(result) >= total):
+                break
+            skip += take
+            if skip > 50000:
+                raise NitError("Розклад містить забагато рядків для одного експорту")
+        return result
 
     def get_teacher_diary(self, week_start: date) -> dict[str, Any]:
         """Отримує персональний тиждень у підтвердженому форматі teacher-diary."""

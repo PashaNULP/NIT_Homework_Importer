@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import calendar
+import json
+import os
 import secrets
 import tempfile
 from datetime import date, datetime, timedelta
@@ -11,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from nicegui import run, ui
+    from nicegui import app, run, ui
 except ImportError:
     print(
         "Не встановлено NiceGUI. Виконайте:\n"
@@ -29,8 +31,9 @@ from nit_core import (
     NitError,
     apply_absence_reminders,
     apply_import_preview,
-    connect_with_password,
+    build_all_teachers_schedule,
     connect_with_saved_session,
+    connect_user_with_password,
     load_calendar_reports,
     load_journal_report,
     load_journal_matrix,
@@ -40,9 +43,8 @@ from nit_core import (
     refresh_auth_context,
     save_import_template,
     save_lesson_reports,
-    saved_session_available,
 )
-from nit_auth import NitUserConfig
+from nit_auth import MemorySessionStore, NitUserConfig
 from nit_homework_v2 import DEFAULT_SCHOOL_ID, DEFAULT_USER_ID, compact, parse_date_value
 from nit_schedule import (
     KYIV,
@@ -79,6 +81,11 @@ UK_MONTHS = (
 WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд")
 
 
+_WEB_SESSION_STORES: dict[str, MemorySessionStore] = {}
+_WEB_SESSION_CONFIGS: dict[str, NitUserConfig] = {}
+_STORAGE_SECRET = os.getenv("NIT2_STORAGE_SECRET") or secrets.token_urlsafe(32)
+
+
 def lesson_day(lesson: dict[str, Any]) -> date | None:
     try:
         return parse_date_value(lesson.get("day") or lesson.get("date"))
@@ -89,6 +96,15 @@ def lesson_day(lesson: dict[str, Any]) -> date | None:
 class NitWebApp:
     def __init__(self) -> None:
         self.client = ui.context.client
+        self.server_config = NitUserConfig.from_environment(DEFAULT_SCHOOL_ID, DEFAULT_USER_ID)
+        user_storage = app.storage.user
+        self.session_handle = str(user_storage.get("nit2_session_handle") or "")
+        if not self.session_handle:
+            self.session_handle = secrets.token_urlsafe(24)
+            user_storage["nit2_session_handle"] = self.session_handle
+        self.session_store = _WEB_SESSION_STORES.setdefault(
+            self.session_handle, MemorySessionStore()
+        )
         self.auth: AuthContext | None = None
         self.semester: int | None = None
         self.journals: list[dict[str, Any]] = []
@@ -126,6 +142,7 @@ class NitWebApp:
         self.dark_mode = None
         self.theme_button = None
         self.theme_tooltip = None
+        self.logout_button = None
         self.header_controls = None
         self.header_tabs = None
         self.content = None
@@ -134,6 +151,13 @@ class NitWebApp:
         self.import_box = None
         self.absence_box = None
         self.absence_table = None
+        self.overview_absence_title = None
+        self.overview_absence_meta = None
+        self.today_date_label = None
+        self.today_focus_title = None
+        self.today_focus_meta = None
+        self.today_countdown_label = None
+        self.today_total_label = None
         self.schedule_box = None
         self.schedule_week = monday_of(datetime.now(KYIV).date())
         self.schedule_data: WeekSchedule | None = None
@@ -147,20 +171,11 @@ class NitWebApp:
         self.offline_schedule_mode = False
         self.main_tabs = None
         self.schedule_tab = None
+        self.journal_tab = None
+        self.import_tab = None
+        self.absence_tab = None
         self.session_refresh_failed = False
         self.session_timer = None
-        offline_config = NitUserConfig.from_environment(DEFAULT_SCHOOL_ID, DEFAULT_USER_ID)
-        offline_identity = profile_storage_key(
-            offline_config.profile, offline_config.school_id, offline_config.user_id
-        )
-        self.schedule_storage = ScheduleStorage(
-            Path.cwd() / ".nit2_data" / "schedule", offline_identity
-        )
-        self.bell_settings = self.schedule_storage.load_bells()
-        self.official_bells = self.schedule_storage.load_official_bells()
-        if self.official_bells is not None:
-            self.bell_source = "nit"
-        self.schedule_data = self.schedule_storage.load_week(self.schedule_week)
         self._build_shell()
 
     def _build_shell(self) -> None:
@@ -248,6 +263,38 @@ class NitWebApp:
                 backdrop-filter: blur(12px);
               }
               .metric { min-width: 170px; }
+              .overview-dashboard-grid {
+                display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 12px; width: 100%;
+              }
+              .overview-panel {
+                display: flex; flex-direction: column; gap: 12px !important;
+              }
+              .overview-widget { min-height: 170px; }
+              .overview-status-row {
+                display: flex; align-items: center; gap: 10px;
+                width: 100%;
+                min-height: 42px; padding: 8px 10px; border-radius: 12px;
+                background: #f8fafc; border: 1px solid #e2e8f0;
+              }
+              .overview-status-icon {
+                width: 34px; height: 34px; flex: 0 0 34px;
+                display: flex; align-items: center; justify-content: center;
+                border-radius: 10px; background: #eef2ff; color: #4f46e5;
+              }
+              .lesson-countdown {
+                margin-left: auto; padding: 7px 11px; border-radius: 10px;
+                color: #3730a3; background: #e0e7ff;
+                border: 1px solid #c7d2fe;
+                font-size: 13px; font-weight: 750;
+                font-variant-numeric: tabular-nums; white-space: nowrap;
+              }
+              .journal-summary-bar {
+                display: grid; grid-template-columns: minmax(360px, 720px) auto;
+                align-items: center; justify-content: space-between;
+                gap: 18px; width: 100%;
+              }
+              .journal-summary-actions { flex-wrap: nowrap; }
               .calendar-cell {
                 min-height: 125px; cursor: pointer; transition: .18s ease;
                 border-radius: 16px; box-shadow: none;
@@ -308,13 +355,51 @@ class NitWebApp:
               .q-field--outlined .q-field__control { border-radius: 12px; }
               .q-table thead tr { background: #f8fafc; }
               .q-table th { color: #475569; font-weight: 700; }
+              .nit-data-table {
+                overflow: hidden; border-radius: 14px;
+                border: 1px solid #dbe3ee !important;
+                box-shadow: none;
+              }
+              .nit-data-table .q-table {
+                font-family: inherit; font-size: 14px;
+                font-variant-numeric: tabular-nums;
+              }
+              .nit-data-table .q-table thead tr { height: 46px; }
+              .nit-data-table .q-table th {
+                padding: 9px 12px;
+                color: #475569; background: #f1f5f9;
+                border-color: #dbe3ee;
+                font-size: 12px; font-weight: 750;
+                letter-spacing: .025em; line-height: 1.25;
+                white-space: nowrap;
+              }
+              .nit-data-table .q-table tbody tr { transition: background .14s ease; }
+              .nit-data-table .q-table tbody td {
+                height: 50px; padding: 10px 12px;
+                color: #334155; background: #ffffff;
+                border-color: #e2e8f0;
+                line-height: 1.45; vertical-align: middle;
+              }
+              .nit-data-table .q-table tbody tr:nth-child(even) td {
+                background: #f8fafc;
+              }
+              .nit-data-table .q-table tbody tr:hover td {
+                background: #eef2ff;
+              }
+              .nit-data-table .q-table__bottom {
+                min-height: 48px; padding: 7px 12px;
+                color: #64748b; background: #f8fafc;
+                border-color: #e2e8f0;
+                font-size: 13px;
+              }
+              .nit-data-table .q-checkbox__inner { font-size: 36px; }
               .overview-table .q-table__middle { overflow-x: hidden; }
               .overview-table table { width: 100%; table-layout: fixed; }
-              .overview-table th:nth-child(1), .overview-table td:nth-child(1) { width: 10%; }
-              .overview-table th:nth-child(2), .overview-table td:nth-child(2) { width: 7%; }
+              .overview-table th:nth-child(1), .overview-table td:nth-child(1) { width: 9%; }
+              .overview-table th:nth-child(2), .overview-table td:nth-child(2) { width: 6%; }
               .overview-table th:nth-child(3), .overview-table td:nth-child(3) { width: 28%; }
-              .overview-table th:nth-child(4), .overview-table td:nth-child(4) { width: 42%; }
-              .overview-table th:nth-child(5), .overview-table td:nth-child(5) { width: 13%; }
+              .overview-table th:nth-child(4), .overview-table td:nth-child(4) { width: 47%; }
+              .overview-table th:nth-child(5), .overview-table td:nth-child(5) { width: 10%; }
               .overview-table td:nth-child(3),
               .overview-table td:nth-child(4) {
                 white-space: normal; overflow-wrap: anywhere; word-break: break-word;
@@ -348,13 +433,17 @@ class NitWebApp:
               }
               .schedule-grid {
                 width: 100%; min-width: 840px; border-collapse: separate; border-spacing: 0;
+                font-family: inherit; font-size: 14px; font-variant-numeric: tabular-nums;
               }
               .schedule-grid th, .schedule-grid td {
-                min-width: 145px; padding: 10px; vertical-align: top;
+                min-width: 145px; padding: 10px 12px; vertical-align: top;
                 border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0;
                 background: white;
               }
-              .schedule-grid th { background: #eef2ff; color: #334155; text-align: left; }
+              .schedule-grid th {
+                height: 46px; background: #eef2ff; color: #334155; text-align: left;
+                font-size: 12px; font-weight: 750; letter-spacing: .025em;
+              }
               .schedule-grid .schedule-number {
                 min-width: 58px; width: 58px; text-align: center; font-weight: 700;
                 background: #f8fafc;
@@ -374,7 +463,7 @@ class NitWebApp:
               .journal-grid {
                 border-collapse: separate; border-spacing: 0;
                 min-width: 100%; width: max-content;
-                font-variant-numeric: tabular-nums;
+                font-family: inherit; font-size: 14px; font-variant-numeric: tabular-nums;
               }
               .journal-grid th, .journal-grid td {
                 min-width: 70px; height: 48px; padding: 7px 9px;
@@ -384,7 +473,9 @@ class NitWebApp:
               }
               .journal-grid thead th {
                 position: sticky; top: 0; z-index: 3;
+                height: 42px;
                 color: #334155; background: #eef2ff;
+                font-size: 12px; font-weight: 750; letter-spacing: .02em;
               }
               .journal-grid .journal-student {
                 position: sticky; left: 0; z-index: 2;
@@ -396,6 +487,8 @@ class NitWebApp:
                 top: 0; left: 0; z-index: 5; background: #e0e7ff;
               }
               .journal-grid .journal-student .row { min-width: 0; flex-wrap: nowrap; }
+              .journal-grid tbody tr:nth-child(even) td { background: #f8fafc; }
+              .journal-grid tbody tr:nth-child(even) .journal-student { background: #f1f5f9; }
               .journal-grid tbody tr:hover td { background: #f8fafc; }
               .journal-grid tbody tr:hover .journal-student { background: #eef2ff; }
               .journal-mark { font-weight: 700; color: #3730a3; }
@@ -413,9 +506,46 @@ class NitWebApp:
                 border-color: rgba(100,116,139,.38);
                 box-shadow: 0 14px 38px rgba(0,0,0,.24);
               }
+              body.body--dark .overview-status-row {
+                background: #111c30; border-color: #334155;
+              }
+              body.body--dark .overview-status-icon {
+                color: #a5b4fc; background: #25275b;
+              }
+              body.body--dark .lesson-countdown {
+                color: #e0e7ff; background: #28276a; border-color: #4f46e5;
+              }
+              body.body--dark .overview-table .q-table__middle,
+              body.body--dark .overview-table tbody td {
+                color: #e2e8f0; background: #0f172a; border-color: #334155;
+              }
+              body.body--dark .overview-table tbody tr:hover td {
+                background: #111c30;
+              }
               body.body--dark .calendar-selected { background: #26245f; outline-color: #818cf8; }
               body.body--dark .q-table thead tr { background: #172033; }
               body.body--dark .q-table th { color: #cbd5e1; }
+              body.body--dark .nit-data-table {
+                border-color: #334155 !important;
+              }
+              body.body--dark .nit-data-table .q-table__middle {
+                background: #0f172a;
+              }
+              body.body--dark .nit-data-table .q-table th {
+                color: #dbeafe; background: #1e293b; border-color: #3b4a61;
+              }
+              body.body--dark .nit-data-table .q-table tbody td {
+                color: #e2e8f0; background: #0f172a; border-color: #27364b;
+              }
+              body.body--dark .nit-data-table .q-table tbody tr:nth-child(even) td {
+                background: #111c30;
+              }
+              body.body--dark .nit-data-table .q-table tbody tr:hover td {
+                background: #172554;
+              }
+              body.body--dark .nit-data-table .q-table__bottom {
+                color: #94a3b8; background: #111c30; border-color: #334155;
+              }
               body.body--dark .journal-scroll {
                 background: #0f172a; border-color: #334155;
               }
@@ -427,6 +557,8 @@ class NitWebApp:
               body.body--dark .journal-grid thead th { color: #e0e7ff; background: #25275b; }
               body.body--dark .journal-grid .journal-student { background: #111c30; }
               body.body--dark .journal-grid thead .journal-student { background: #312e81; }
+              body.body--dark .journal-grid tbody tr:nth-child(even) td { background: #111c30; }
+              body.body--dark .journal-grid tbody tr:nth-child(even) .journal-student { background: #142037; }
               body.body--dark .journal-grid tbody tr:hover td { background: #172554; }
               body.body--dark .journal-grid tbody tr:hover .journal-student { background: #1e293b; }
               body.body--dark .journal-mark { color: #a5b4fc; }
@@ -460,6 +592,168 @@ class NitWebApp:
               body.body--dark .bg-indigo-50 { background: #1e1b4b !important; }
               body.body--dark .text-indigo-900 { color: #e0e7ff !important; }
               body.body--dark .border-indigo-100 { border-color: #3730a3 !important; }
+
+              /* Responsive shell: keep the page itself fixed while data grids scroll. */
+              html, body, #q-app { max-width: 100%; overflow-x: hidden; }
+              .nicegui-content { width: 100%; max-width: 100%; padding: 0 !important; }
+              .nit-content, .q-tab-panels, .q-tab-panel { min-width: 0; max-width: 100%; }
+              .schedule-scroll, .journal-scroll, .q-table__middle {
+                -webkit-overflow-scrolling: touch;
+              }
+
+              @media (max-width: 900px) {
+                .nit-header { padding: 8px 10px !important; }
+                .header-main {
+                  display: grid !important;
+                  grid-template-columns: minmax(0, 1fr) auto;
+                  gap: 8px 10px !important;
+                }
+                .header-brand { min-width: 0; }
+                .header-controls {
+                  grid-column: 1 / -1;
+                  grid-row: 2;
+                  width: 100%; max-width: none; padding: 0;
+                }
+                .header-actions { grid-column: 2; grid-row: 1; }
+                .header-tabs { width: 100%; }
+                .nit-content { padding: 4px 8px 12px !important; }
+                .overview-table .q-table__middle { overflow-x: auto; }
+                .overview-table table { min-width: 760px; }
+                .calendar-detail-table { max-width: 100%; }
+                .overview-dashboard-grid { grid-template-columns: 1fr; }
+                .journal-summary-bar { grid-template-columns: 1fr; }
+                .journal-summary-actions { flex-wrap: wrap; }
+              }
+
+              @media (max-width: 600px) {
+                .brand-orbit {
+                  width: 38px; height: 38px; flex: 0 0 38px; border-radius: 12px;
+                }
+                .brand-logo { width: 34px; height: 34px; }
+                .brand-name { font-size: 20px !important; }
+                .brand-tagline { display: none; }
+                .header-brand { gap: 10px !important; }
+                .header-actions { gap: 2px !important; }
+                .status-pill {
+                  max-width: 156px; padding: 6px 9px; gap: 5px !important;
+                }
+                .status-pill .q-icon { display: none; }
+                .status-pill .q-label {
+                  overflow: hidden; text-overflow: ellipsis; font-size: 11px !important;
+                }
+                .header-controls { gap: 6px !important; }
+                .header-controls .q-field { min-width: 0 !important; }
+                .header-controls .q-field__control { min-height: 40px; height: 40px; }
+                .header-semesters { flex: 0 0 auto; }
+                .header-semesters .q-btn {
+                  min-height: 34px; padding: 0 9px; font-size: 12px;
+                }
+                .header-tabs-wrap { padding-top: 4px !important; }
+                .header-tabs { padding: 3px; border-radius: 12px; }
+                .header-tabs .q-tab { min-height: 42px; padding: 0 4px; }
+                .header-tabs .q-tab__icon { font-size: 23px; margin: 0; }
+                .header-tabs .q-tab__label { display: none; }
+
+                .nit-content { padding: 3px 6px 10px !important; gap: 6px !important; }
+                .q-tab-panel { padding: 0 !important; }
+                .nit-card {
+                  min-width: 0; max-width: 100%; padding: 12px !important; border-radius: 15px;
+                  backdrop-filter: none;
+                }
+                .nit-content > .row.mt-8 { margin-top: 12px !important; }
+                .nit-card > .row, .nit-card > .column > .row {
+                  flex-wrap: wrap;
+                }
+                .nit-card .q-btn__content {
+                  min-width: 0; white-space: normal; line-height: 1.2;
+                }
+                .lesson-countdown {
+                  flex: 1 1 100%; margin-left: 44px; width: max-content;
+                  max-width: calc(100% - 44px); text-align: center;
+                }
+                .nit-card .q-field { max-width: 100%; }
+                .nit-card .min-w-72, .nit-card .min-w-48, .nit-card .min-w-52 {
+                  min-width: 0 !important;
+                }
+                .nit-card h1, .nit-card .text-xl { font-size: 18px !important; }
+                .metric {
+                  flex: 1 1 calc(50% - 6px) !important;
+                  min-width: 0; padding: 11px !important;
+                }
+                .metric .row { flex-wrap: nowrap !important; }
+                .metric .text-3xl { font-size: 24px !important; }
+                .metric .q-icon { font-size: 26px !important; }
+
+                .schedule-scroll, .journal-scroll {
+                  border-radius: 12px; max-width: 100%; touch-action: pan-x pan-y;
+                }
+                .schedule-grid { min-width: 740px; }
+                .schedule-grid th, .schedule-grid td {
+                  min-width: 126px; padding: 8px;
+                }
+                .schedule-grid .schedule-number { min-width: 54px; width: 54px; }
+                .month-grid { min-width: 760px; }
+                .month-grid th, .month-grid td { min-width: 106px; }
+                .month-day { height: 94px; padding: 6px !important; }
+                .month-class-chip { padding: 2px 5px; font-size: 11px; }
+                .journal-scroll { max-height: 62vh; }
+                .journal-grid .journal-student {
+                  min-width: 170px; width: 170px; max-width: 170px;
+                }
+                .journal-grid th, .journal-grid td {
+                  min-width: 56px; height: 48px; padding: 5px 6px;
+                }
+                .journal-grid .journal-student .row {
+                  align-items: flex-start; gap: 5px !important;
+                }
+                .journal-grid .journal-student .font-medium {
+                  display: -webkit-box;
+                  overflow: hidden;
+                  white-space: normal !important;
+                  text-overflow: ellipsis;
+                  overflow-wrap: anywhere;
+                  -webkit-box-orient: vertical;
+                  -webkit-line-clamp: 2;
+                  line-height: 1.25;
+                  font-size: 12px;
+                }
+                .journal-grid .journal-student .text-xs {
+                  width: 16px !important; flex: 0 0 16px;
+                }
+                .journal-grid thead .journal-student .font-bold {
+                  font-size: 13px;
+                }
+
+                .bells-grid { grid-template-columns: 1fr; }
+                .bell-card { padding: 10px; gap: 9px; }
+                .bell-number { width: 40px; height: 40px; flex-basis: 40px; }
+                .bell-time { font-size: 16px; }
+                .bell-break { padding: 3px 6px; font-size: 11px; }
+                .bell-editor-row { align-items: flex-end !important; }
+                .bell-editor-row .q-field { flex: 1 1 calc(50% - 8px); width: auto !important; }
+                .bell-editor-row .q-field:first-child { flex: 0 0 68px; }
+
+                .q-table__container { max-width: 100%; }
+                .q-table__middle { max-width: 100%; overflow-x: auto !important; }
+                .overview-table table { min-width: 700px; }
+                .calendar-detail-table table { min-width: 780px; }
+                .responsive-controls { align-items: stretch !important; }
+                .responsive-controls > .q-field { flex: 1 1 100%; width: 100%; }
+                .responsive-controls > .q-checkbox { flex: 1 1 100%; }
+                .responsive-controls > .q-btn { margin-left: auto; }
+                .q-dialog__inner { padding: 12px !important; }
+                .q-dialog__inner > .q-card {
+                  width: 100% !important; max-width: calc(100vw - 24px) !important;
+                  padding: 16px !important;
+                }
+                .q-notification { max-width: calc(100vw - 24px) !important; }
+              }
+
+              @media (max-width: 420px) {
+                .status-pill { display: none !important; }
+                .header-actions { min-width: 42px; }
+                .nit-card .q-btn { font-size: 12px; }
+              }
             </style>
             """
         )
@@ -467,19 +761,21 @@ class NitWebApp:
         with ui.header().classes("nit-header px-4 md:px-7 py-2 gap-1").style(
             "flex-direction: column; align-items: stretch;"
         ):
-            with ui.row().classes("w-full items-center gap-4 flex-nowrap"):
-                with ui.row().classes("items-center gap-4 flex-nowrap shrink-0"):
+            with ui.row().classes("header-main w-full items-center gap-4 flex-nowrap"):
+                with ui.row().classes("header-brand items-center gap-4 flex-nowrap shrink-0"):
                     with ui.element("div").classes("brand-orbit"):
                         ui.image(Path(__file__).with_name("image.png")).classes("brand-logo")
                     with ui.column().classes("gap-0"):
                         ui.label("NIT²").classes("brand-name text-2xl font-bold leading-none")
-                        ui.label("by FIZYK · краще ніж було").classes("text-xs text-cyan-100 mt-1")
+                        ui.label("by FIZYK · краще ніж було").classes(
+                            "brand-tagline text-xs text-cyan-100 mt-1"
+                        )
 
                 self.header_controls = ui.row().classes(
                     "header-controls grow items-center justify-center gap-2 flex-nowrap"
                 )
 
-                with ui.row().classes("items-center gap-2 flex-nowrap shrink-0"):
+                with ui.row().classes("header-actions items-center gap-2 flex-nowrap shrink-0"):
                     with ui.button(
                         icon="light_mode",
                         on_click=self._toggle_theme,
@@ -490,18 +786,28 @@ class NitWebApp:
                         self.status_label = ui.label("Не авторизовано").classes(
                             "text-sm text-white whitespace-nowrap"
                         )
+                    with ui.button(
+                        icon="logout",
+                        on_click=self.logout,
+                    ).props("flat round color=white") as self.logout_button:
+                        ui.tooltip("Вийти з облікового запису")
+                    self.logout_button.set_visibility(False)
 
             self.header_tabs = ui.row().classes(
                 "header-tabs-wrap w-full items-center justify-center pt-1"
             )
 
         self.content = ui.column().classes(
-            "w-full max-w-none px-2 md:px-3 pt-1 pb-3 gap-2"
+            "nit-content w-full max-w-none px-2 md:px-3 pt-1 pb-3 gap-2"
         )
         self.render()
         self.session_timer = ui.timer(60.0, self._keep_session_alive)
+        self.today_clock_timer = ui.timer(1.0, self._update_today_lesson_widget)
 
-        if saved_session_available():
+        if (
+            self.session_store.load() is not None
+            and self.session_handle in _WEB_SESSION_CONFIGS
+        ):
             ui.timer(0.2, self.connect_saved, once=True)
 
     def _toggle_theme(self) -> None:
@@ -518,6 +824,8 @@ class NitWebApp:
 
     def render(self) -> None:
         assert self.content is not None
+        if self.logout_button is not None:
+            self.logout_button.set_visibility(self.auth is not None)
         self.content.clear()
         with self.content:
             if self.auth is None:
@@ -546,16 +854,9 @@ class NitWebApp:
                         ui.label("Вітаємо у NIT²").classes("text-2xl font-bold")
                         ui.label("Інструменти вчителя від FIZYK").classes("text-sm text-slate-500")
                 ui.label(
-                    "Токени залишаються у Python-процесі та macOS Keychain і не передаються сторінці."
+                    "Кожен браузер має окрему сесію. Токени зберігаються лише в пам’яті "
+                    "сервера до виходу або його перезапуску."
                 ).classes("text-sm text-slate-600")
-
-                if saved_session_available():
-                    ui.button(
-                        "Використати збережену сесію",
-                        icon="key",
-                        on_click=self.connect_saved,
-                    ).classes("w-full")
-                    ui.separator()
 
                 email = ui.input("Email НІТ").props("outlined autocomplete=username").classes("w-full")
                 password = ui.input(
@@ -571,13 +872,6 @@ class NitWebApp:
                     await self.connect_password(email.value or "", raw_password)
 
                 ui.button("Увійти", icon="login", on_click=login).classes("w-full")
-                if self.schedule_data is not None:
-                    ui.separator()
-                    ui.button(
-                        "Відкрити збережений розклад офлайн",
-                        icon="cloud_off",
-                        on_click=self._open_offline_schedule,
-                    ).props("outline no-caps").classes("w-full")
                 ui.label("Пароль використовується лише для OAuth-входу й не зберігається.").classes(
                     "text-xs text-slate-500"
                 )
@@ -607,11 +901,23 @@ class NitWebApp:
         self.busy = True
         self._set_status("Поновлення збереженої сесії…")
         try:
-            context = await run.io_bound(connect_with_saved_session)
+            config = _WEB_SESSION_CONFIGS.get(self.session_handle)
+            if config is None:
+                raise NitError("Сесію цього браузера не знайдено")
+            context = await run.io_bound(
+                connect_with_saved_session,
+                self.session_store,
+                config,
+            )
             if context is None:
                 raise NitError("Збережена сесія не знайдена або не поновилася")
             await self._finish_connect(context)
         except Exception as exc:
+            self.session_store.delete()
+            _WEB_SESSION_CONFIGS.pop(self.session_handle, None)
+            self.auth = None
+            self.schedule_storage = None
+            self.schedule_data = None
             self._show_error(exc)
             self._set_status("Не авторизовано")
             self.render()
@@ -627,19 +933,27 @@ class NitWebApp:
         self.busy = True
         self._set_status("Авторизація…")
         try:
-            context = await run.io_bound(connect_with_password, email.strip(), password)
+            preferred_school = self.server_config.school_id or None
+            context = await run.io_bound(
+                connect_user_with_password,
+                email.strip(),
+                password,
+                self.session_store,
+                preferred_school,
+            )
+            if context.user_config is None:
+                raise NitError("НІТ не повернув профіль користувача")
+            _WEB_SESSION_CONFIGS[self.session_handle] = context.user_config
             await self._finish_connect(context)
-            if context.session_saved:
-                self._notify("Вхід успішний, сесію збережено в Keychain", type="positive")
-            else:
-                self._notify(
-                    "Вхід успішний, але Keychain не зберіг сесію; "
-                    "вона діятиме до закриття застосунку",
-                    type="warning",
-                )
         except Exception as exc:
+            self.session_store.delete()
+            _WEB_SESSION_CONFIGS.pop(self.session_handle, None)
+            self.auth = None
+            self.schedule_storage = None
+            self.schedule_data = None
             self._show_error(exc)
             self._set_status("Не авторизовано")
+            self.render()
         finally:
             self.busy = False
 
@@ -661,6 +975,56 @@ class NitWebApp:
         await self._load_schedule_week(render_after=False, notify=False)
         year = context.active_year
         self._set_status(f"{year.get('yearStart')}/{year.get('yearEnd')} · підключено")
+        self.render()
+
+    async def logout(self) -> None:
+        """Завершує лише сесію поточного браузера та очищає його дані з UI."""
+        if self.busy:
+            self._notify("Зачекайте завершення поточної операції", type="warning")
+            return
+        self.session_store.delete()
+        _WEB_SESSION_CONFIGS.pop(self.session_handle, None)
+        self.session_store = MemorySessionStore()
+        _WEB_SESSION_STORES[self.session_handle] = self.session_store
+
+        self.auth = None
+        self.semester = None
+        self.journals = []
+        self.selected_journal_id = None
+        self.report = None
+        self.calendar_reports = []
+        self.calendar_loaded = False
+        self.calendar_loading = False
+        self.calendar_load_attempted = False
+        self.journal_matrix = None
+        self.journal_loading = False
+        self.journal_load_attempted = False
+        self.excel_name = None
+        self.excel_sheet = None
+        self.excel_rows = []
+        self.excel_has_date = False
+        self.import_preview = None
+        self.import_preview_token = None
+        self.import_in_progress = False
+        self.absence_reminders = []
+        self.absence_loaded = False
+        self.absence_loading = False
+        self.absence_load_attempted = False
+        self.absence_class = None
+        self.absence_action_token = None
+        self.absence_in_progress = False
+        self.absence_row_map = {}
+        self.schedule_data = None
+        self.schedule_storage = None
+        self.bell_settings = BellSettings(
+            "Звичайний", {"Звичайний": [], "Скорочений": []}
+        )
+        self.official_bells = None
+        self.bell_source = "local"
+        self.schedule_error = None
+        self.offline_schedule_mode = False
+        self.session_refresh_failed = False
+        self._set_status("Не авторизовано")
         self.render()
 
     async def _ensure_session(self) -> None:
@@ -720,9 +1084,12 @@ class NitWebApp:
         )
         self.main_tabs = tabs
         self.schedule_tab = schedule_tab
+        self.journal_tab = journal_tab
+        self.import_tab = import_tab
+        self.absence_tab = absence_tab
 
         with ui.tab_panels(tabs, value=overview_tab).classes("w-full bg-transparent"):
-            with ui.tab_panel(overview_tab).classes("p-0"):
+            with ui.tab_panel(overview_tab).classes("overview-panel p-0"):
                 self._render_overview()
             with ui.tab_panel(schedule_tab).classes("p-0"):
                 self.schedule_box = ui.column().classes("w-full gap-3")
@@ -736,6 +1103,9 @@ class NitWebApp:
             with ui.tab_panel(absence_tab).classes("p-0"):
                 self.absence_box = ui.column().classes("w-full gap-4")
                 self._refresh_absence_panel()
+
+        if not self.absence_loaded and not self.absence_loading:
+            ui.timer(0.5, self._auto_load_absences, once=True)
 
     def _render_header_navigation(self) -> tuple[Any, Any, Any, Any, Any, Any]:
         assert self.auth is not None
@@ -788,15 +1158,56 @@ class NitWebApp:
         report = self.report
         lessons = report.lessons if report else []
         filled = sum(1 for item in lessons if item.get("isFilled"))
-        with ui.row().classes("w-full gap-4"):
-            self._metric("Журналів", len(self.journals), "class")
-            self._metric("Уроків", len(lessons), "event")
-            self._metric("Заповнено", filled, "check_circle", "text-green-600")
-            self._metric("Не заповнено", len(lessons) - filled, "radio_button_unchecked", "text-orange-600")
+        unfilled = len(lessons) - filled
 
-        self._render_today_schedule_widget()
+        with ui.element("div").classes("overview-dashboard-grid"):
+            self._render_today_schedule_widget()
+            self._render_attention_widget(unfilled)
 
-        with ui.card().classes("nit-card w-full p-4 mt-4"):
+        journal = report.journal if report else self._current_journal() or {}
+        class_name = compact(journal.get("className")) or "Клас не вибрано"
+        subject = compact(journal.get("subject")) or "Предмет"
+        progress = filled / len(lessons) if lessons else 0.0
+        today = datetime.now(KYIV).date()
+        upcoming = sorted(
+            (day for item in lessons if (day := lesson_day(item)) and day >= today)
+        )
+        with ui.card().classes("nit-card w-full p-4 gap-3"):
+            with ui.element("div").classes("journal-summary-bar"):
+                with ui.column().classes("gap-2 min-w-0"):
+                    with ui.row().classes("items-center gap-2 flex-wrap"):
+                        ui.icon("menu_book", size="24px").classes("text-primary")
+                        ui.label(f"{class_name} · {subject}").classes(
+                            "text-lg font-semibold"
+                        )
+                    ui.label(
+                        f"{len(lessons)} уроків · {filled} заповнено · "
+                        f"{unfilled} потребують уваги"
+                    ).classes("text-sm text-slate-500")
+                    ui.linear_progress(
+                        value=progress,
+                        show_value=False,
+                        size="8px",
+                    ).props(
+                        "rounded color=primary track-color=blue-grey-8"
+                    ).classes("w-full")
+                    if upcoming:
+                        ui.label(f"Найближчий урок: {upcoming[0]:%d.%m.%Y}").classes(
+                            "text-xs text-slate-500"
+                        )
+                with ui.row().classes("journal-summary-actions items-center gap-2"):
+                    ui.button(
+                        "Відкрити журнал",
+                        icon="assignment",
+                        on_click=self._open_journal_tab,
+                    ).props("outline no-caps")
+                    ui.button(
+                        "Імпорт Excel",
+                        icon="upload_file",
+                        on_click=self._open_import_tab,
+                    ).props("no-caps")
+
+        with ui.card().classes("nit-card w-full p-4"):
             with ui.row().classes("w-full justify-between items-center"):
                 ui.label("Уроки вибраного журналу").classes("text-lg font-semibold")
                 with ui.row().classes("gap-2"):
@@ -811,7 +1222,7 @@ class NitWebApp:
                 rows=self._lesson_rows(lessons),
                 row_key="key",
                 pagination={"rowsPerPage": 15},
-            ).props("flat bordered").classes("overview-table w-full")
+            ).props("flat bordered").classes("nit-data-table overview-table w-full")
 
     async def _tab_changed(self, event: Any) -> None:
         selected = getattr(event.value, "label", event.value)
@@ -823,47 +1234,221 @@ class NitWebApp:
         elif selected == "Відсутності" and not self.absence_loaded and not self.absence_loading:
             await self.load_absences()
 
-    def _metric(self, title: str, value: int, icon: str, color: str = "text-primary") -> None:
-        with ui.card().classes("nit-card metric grow p-4"):
-            with ui.row().classes("items-center justify-between w-full"):
-                with ui.column().classes("gap-0"):
-                    ui.label(title).classes("text-sm text-slate-500")
-                    ui.label(str(value)).classes("text-3xl font-semibold")
-                ui.icon(icon, size="32px").classes(color)
-
     def _open_schedule_tab(self) -> None:
         if self.main_tabs is not None and self.schedule_tab is not None:
             self.main_tabs.set_value(self.schedule_tab)
+            if self.schedule_data is None and not self.schedule_loading:
+                ui.timer(0.05, self._load_schedule_week, once=True)
+
+    def _open_journal_tab(self) -> None:
+        if self.main_tabs is not None and self.journal_tab is not None:
+            self.main_tabs.set_value(self.journal_tab)
+            if self.journal_matrix is None and not self.journal_loading:
+                ui.timer(0.05, self.load_journal_matrix, once=True)
+
+    def _open_import_tab(self) -> None:
+        if self.main_tabs is not None and self.import_tab is not None:
+            self.main_tabs.set_value(self.import_tab)
+
+    def _open_absence_tab(self) -> None:
+        if self.main_tabs is not None and self.absence_tab is not None:
+            self.main_tabs.set_value(self.absence_tab)
+            if not self.absence_loaded and not self.absence_loading:
+                ui.timer(0.05, self.load_absences, once=True)
+
+    def _render_attention_widget(self, unfilled: int) -> None:
+        with ui.card().classes("nit-card overview-widget w-full p-4 gap-3"):
+            with ui.row().classes("w-full items-center justify-between"):
+                with ui.column().classes("gap-0"):
+                    ui.label("Потребує уваги").classes("text-lg font-semibold")
+                    ui.label("Те, що варто перевірити").classes("text-sm text-slate-500")
+                ui.icon("notifications_active", size="26px").classes(
+                    "text-orange-500" if unfilled else "text-green-500"
+                )
+
+            with ui.element("div").classes("overview-status-row"):
+                ui.icon(
+                    "check_circle" if unfilled == 0 else "edit_note",
+                    size="20px",
+                ).classes("overview-status-icon")
+                with ui.column().classes("gap-0 min-w-0"):
+                    ui.label(
+                        "Вибраний журнал заповнений"
+                        if unfilled == 0
+                        else f"Не заповнено уроків: {unfilled}"
+                    ).classes("font-medium")
+                    ui.label("За вибраним класом і предметом").classes(
+                        "text-xs text-slate-500"
+                    )
+
+            with ui.element("div").classes("overview-status-row"):
+                ui.icon("person_off", size="20px").classes("overview-status-icon")
+                with ui.column().classes("gap-0 min-w-0 grow"):
+                    if self.absence_loaded:
+                        self.overview_absence_title = ui.label(
+                            f"Непідтверджених відсутностей: {len(self.absence_reminders)}"
+                        ).classes("font-medium")
+                        self.overview_absence_meta = ui.label(
+                            "У всіх класах цього семестру"
+                        ).classes(
+                            "text-xs text-slate-500"
+                        )
+                    elif self.absence_loading:
+                        self.overview_absence_title = ui.label(
+                            "Перевіряю відсутності…"
+                        ).classes("font-medium")
+                        self.overview_absence_meta = ui.label(
+                            "Завантажую червоні трикутники з НІТ"
+                        ).classes("text-xs text-slate-500")
+                    else:
+                        self.overview_absence_title = ui.label(
+                            "Відсутності ще не перевірено"
+                        ).classes("font-medium")
+                        self.overview_absence_meta = ui.label(
+                            "Очікую на фонову перевірку"
+                        ).classes(
+                            "text-xs text-slate-500"
+                        )
+                ui.button(icon="arrow_forward", on_click=self._open_absence_tab).props(
+                    "flat round"
+                )
+
+    async def _auto_load_absences(self) -> None:
+        if self.auth is None or self.absence_loaded or self.absence_loading:
+            return
+        if self.busy:
+            ui.timer(0.5, self._auto_load_absences, once=True)
+            return
+        await self.load_absences()
+
+    def _update_overview_absence_widget(self) -> None:
+        if self.overview_absence_title is None or self.overview_absence_meta is None:
+            return
+        if self.absence_loaded:
+            self.overview_absence_title.set_text(
+                f"Непідтверджених відсутностей: {len(self.absence_reminders)}"
+            )
+            self.overview_absence_meta.set_text("У всіх класах цього семестру")
+        elif self.absence_loading:
+            self.overview_absence_title.set_text("Перевіряю відсутності…")
+            self.overview_absence_meta.set_text("Завантажую червоні трикутники з НІТ")
+        elif self.absence_load_attempted:
+            self.overview_absence_title.set_text("Не вдалося перевірити відсутності")
+            self.overview_absence_meta.set_text("Відкрийте вкладку та спробуйте ще раз")
+        else:
+            self.overview_absence_title.set_text("Відсутності ще не перевірено")
+            self.overview_absence_meta.set_text("Очікую на фонову перевірку")
 
     def _render_today_schedule_widget(self) -> None:
         today = datetime.now(KYIV).date()
-        lessons = []
-        if self.schedule_data and self.schedule_data.week_start == monday_of(today):
-            lessons = [item for item in self.schedule_data.lessons if item.day == today]
-        current, following = current_and_next(self.schedule_data, self._effective_bells())
-        focus = current or following
-        with ui.card().classes("nit-card w-full p-4 mt-4"):
-            with ui.row().classes("w-full items-center justify-between gap-3"):
-                with ui.column().classes("gap-1"):
-                    ui.label("Мої уроки сьогодні").classes("text-lg font-semibold")
-                    ui.label(f"Уроків: {len(lessons)}").classes("text-sm text-slate-500")
-                    if focus:
-                        lesson, period = focus
-                        prefix = "Зараз" if current else "Далі"
-                        ui.label(
-                            f"{prefix}: {lesson.number} урок · {lesson.class_name} · "
-                            f"{lesson.subject} · {period.start}–{period.end}"
-                        ).classes("font-medium")
-                    elif lessons:
-                        first = min(lessons, key=lambda item: item.number)
-                        ui.label(
-                            f"Перший: {first.number} урок · {first.class_name} · {first.subject}"
-                        ).classes("font-medium")
-                    else:
-                        ui.label("На сьогодні уроків немає.").classes("text-slate-500")
-                ui.button("Відкрити розклад", icon="calendar_month", on_click=self._open_schedule_tab).props(
-                    "outline no-caps"
+        with ui.card().classes("nit-card overview-widget w-full p-4 gap-3"):
+            with ui.row().classes("w-full items-center justify-between"):
+                with ui.column().classes("gap-0"):
+                    ui.label("Сьогодні").classes("text-lg font-semibold")
+                    self.today_date_label = ui.label(today.strftime("%d.%m.%Y")).classes(
+                        "text-sm text-slate-500"
+                    )
+                ui.icon("today", size="26px").classes("text-primary")
+
+            with ui.element("div").classes("overview-status-row"):
+                ui.icon("schedule", size="20px").classes("overview-status-icon")
+                with ui.column().classes("gap-0 min-w-0 grow"):
+                    self.today_focus_title = ui.label("").classes("font-medium")
+                    self.today_focus_meta = ui.label("").classes(
+                        "text-xs text-slate-500"
+                    )
+                self.today_countdown_label = ui.label("").classes("lesson-countdown")
+
+            with ui.row().classes("w-full items-center justify-between gap-2"):
+                self.today_total_label = ui.label("").classes(
+                    "text-sm text-slate-500"
                 )
+                ui.button(
+                    "Розклад",
+                    icon="calendar_month",
+                    on_click=self._open_schedule_tab,
+                ).props("outline no-caps")
+
+        self._update_today_lesson_widget()
+
+    def _today_schedule(self, today: date) -> WeekSchedule | None:
+        current_week = monday_of(today)
+        if self.schedule_data and self.schedule_data.week_start == current_week:
+            return self.schedule_data
+        if self.schedule_storage is not None:
+            return self.schedule_storage.load_week(current_week)
+        return None
+
+    @staticmethod
+    def _countdown_text(prefix: str, target: datetime, moment: datetime) -> str:
+        seconds = max(0, int((target - moment).total_seconds() + 0.999))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        clock = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+        return f"{prefix} {clock}"
+
+    def _update_today_lesson_widget(self) -> None:
+        labels = (
+            self.today_date_label,
+            self.today_focus_title,
+            self.today_focus_meta,
+            self.today_countdown_label,
+            self.today_total_label,
+        )
+        if self.auth is None or any(label is None for label in labels):
+            return
+
+        moment = datetime.now(KYIV)
+        today = moment.date()
+        schedule = self._today_schedule(today)
+        lessons = [item for item in schedule.lessons if item.day == today] if schedule else []
+        bells = self._effective_bells()
+        current, following = current_and_next(schedule, bells, moment)
+
+        self.today_date_label.set_text(today.strftime("%d.%m.%Y"))
+        self.today_total_label.set_text(f"Усього уроків: {len(lessons)}")
+
+        countdown_text = ""
+        if current:
+            lesson, period = current
+            self.today_focus_title.set_text(f"Зараз: {lesson.number} · {lesson.class_name}")
+            self.today_focus_meta.set_text(
+                f"{lesson.subject} · {period.start}–{period.end}"
+            )
+            end_clock = parse_clock(period.end)
+            if end_clock is not None:
+                target = datetime.combine(today, end_clock, KYIV)
+                countdown_text = self._countdown_text("До кінця уроку", target, moment)
+        elif following:
+            lesson, period = following
+            self.today_focus_title.set_text(
+                f"Наступний урок: {lesson.number} · {lesson.class_name}"
+            )
+            self.today_focus_meta.set_text(
+                f"{lesson.subject} · {period.start}–{period.end}"
+            )
+            start_clock = parse_clock(period.start)
+            if start_clock is not None:
+                target = datetime.combine(today, start_clock, KYIV)
+                countdown_text = self._countdown_text("До початку", target, moment)
+        elif lessons:
+            periods = {
+                item.number: item for item in bells.profiles.get(bells.active_profile, [])
+            }
+            last_lesson = max(lessons, key=lambda item: item.number)
+            last_period = periods.get(last_lesson.number)
+            self.today_focus_title.set_text("Навчальний день завершено")
+            self.today_focus_meta.set_text(
+                f"Останній урок закінчився о {last_period.end}"
+                if last_period else
+                f"Останнім був {last_lesson.number}-й урок"
+            )
+        else:
+            self.today_focus_title.set_text("Уроків на сьогодні немає")
+            self.today_focus_meta.set_text("Можна планувати інші справи")
+
+        self.today_countdown_label.set_text(countdown_text)
+        self.today_countdown_label.set_visibility(bool(countdown_text))
 
     def _refresh_schedule_panel(self) -> None:
         if self.schedule_box is None:
@@ -967,6 +1552,12 @@ class NitWebApp:
                         ui.button(icon="chevron_right", on_click=lambda: self._move_schedule_week(1)).props("flat round")
                         if self.auth is not None:
                             ui.button(icon="refresh", on_click=self._load_schedule_week).props("flat round")
+                            with ui.button(
+                                "Усі вчителі · JSON",
+                                icon="download",
+                                on_click=self.export_all_teachers_schedule,
+                            ).props("outline no-caps"):
+                                ui.tooltip("Завантажити розклад усіх учителів за цей тиждень")
             with ui.row().classes("w-full items-center justify-between gap-3"):
                 view_options = {"lessons": "Тиждень", "bells": "Дзвінки"}
                 if self.auth is not None:
@@ -993,6 +1584,34 @@ class NitWebApp:
             self._render_bells_editor()
         else:
             self._render_week_grid()
+
+    async def export_all_teachers_schedule(self) -> None:
+        if self.auth is None:
+            self._notify("Спочатку увійдіть у НІТ", type="warning")
+            return
+        if self.busy:
+            return
+        self.busy = True
+        self._set_status("Формую JSON розкладу всіх учителів…")
+        try:
+            await self._ensure_session()
+            document = await run.io_bound(
+                build_all_teachers_schedule,
+                self.auth.client,
+                self.schedule_week,
+            )
+            filename = (
+                f"розклад_усіх_вчителів_{document['weekStart']}_{document['weekEnd']}.json"
+            )
+            path = Path(tempfile.gettempdir()) / f"nit2_{secrets.token_hex(4)}_{filename}"
+            content = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+            await run.io_bound(path.write_text, content, "utf-8")
+            ui.download(str(path), filename=filename)
+        except Exception as exc:
+            self._show_error(exc)
+        finally:
+            self.busy = False
+            self._set_connected_status()
 
     def _render_current_lesson(self) -> None:
         current, following = current_and_next(self.schedule_data, self._effective_bells())
@@ -1214,7 +1833,7 @@ class NitWebApp:
             for index, period in enumerate(periods):
                 following = periods[index + 1] if index + 1 < len(periods) else None
                 pause = break_minutes(period, following)
-                with ui.row().classes("w-full items-center gap-3 flex-nowrap"):
+                with ui.row().classes("bell-editor-row w-full items-center gap-3 flex-nowrap"):
                     ui.number("№", value=period.number, min=1, format="%.0f", on_change=lambda e, i=index: self._update_bell(i, "number", e.value)).props(
                         "outlined dense"
                     ).classes("w-24")
@@ -1243,9 +1862,6 @@ class NitWebApp:
             with ui.row().classes("w-full items-center justify-between gap-3"):
                 with ui.column().classes("gap-0"):
                     ui.label("Електронний журнал").classes("text-xl font-semibold")
-                    ui.label(
-                        "Усі учні та уроки семестру в одній таблиці без пагінації."
-                    ).classes("text-sm text-slate-500")
                 if matrix is not None:
                     ui.button(
                         "Оновити журнал",
@@ -1296,10 +1912,6 @@ class NitWebApp:
                                 with ui.element("th"):
                                     ui.label(day.strftime("%d.%m") if day else "—").classes(
                                         "font-bold whitespace-nowrap"
-                                    )
-                                    number = self._lesson_number(lesson.get("lesson"))
-                                    ui.label(f"урок {number}").classes(
-                                        "text-xs text-slate-500 whitespace-nowrap"
                                     )
                     with ui.element("tbody"):
                         for index, student in enumerate(matrix.students, start=1):
@@ -1452,7 +2064,7 @@ class NitWebApp:
             if self.absence_class not in counts:
                 self.absence_class = class_names[0]
 
-            with ui.row().classes("w-full items-end gap-4"):
+            with ui.row().classes("responsive-controls w-full items-end gap-4"):
                 ui.select(
                     {name: f"{name} — {counts[name]} позначок" for name in class_names},
                     value=self.absence_class,
@@ -1486,7 +2098,7 @@ class NitWebApp:
                 row_key="key",
                 selection="multiple",
                 pagination={"rowsPerPage": 15},
-            ).props("flat bordered").classes("w-full")
+            ).props("flat bordered").classes("nit-data-table absence-data-table w-full")
             self.absence_table.selected = list(rows)
             self.absence_table.update()
 
@@ -1503,6 +2115,7 @@ class NitWebApp:
         self.busy = True
         self.absence_loading = True
         self.absence_load_attempted = True
+        self._update_overview_absence_widget()
         self._set_status("Перевірка червоних трикутників…")
         self._refresh_absence_panel()
         try:
@@ -1521,17 +2134,20 @@ class NitWebApp:
             }
             if self.absence_class not in available_classes:
                 self.absence_class = None
+            self._update_overview_absence_widget()
             self._refresh_absence_panel()
         except Exception as exc:
             self.absence_reminders = []
             self.absence_loaded = False
             self.absence_action_token = None
+            self._update_overview_absence_widget()
             self._refresh_absence_panel()
             self._show_error(exc)
         finally:
             self.absence_loading = False
             self.busy = False
             self._set_connected_status()
+            self._update_overview_absence_widget()
             self._refresh_absence_panel()
 
     def _absence_class_changed(self, event: Any) -> None:
@@ -1607,6 +2223,7 @@ class NitWebApp:
                 schedule_id,
             )
             self.absence_loaded = True
+            self._update_overview_absence_widget()
             # Після запису «н» матриця журналу має бути перечитана.
             self.journal_matrix = None
             self.journal_load_attempted = False
@@ -1634,7 +2251,7 @@ class NitWebApp:
     @staticmethod
     def _absence_columns() -> list[dict[str, Any]]:
         return [
-            {"name": "date", "label": "Дата", "field": "date", "sortable": True},
+            {"name": "date", "label": "Дата", "field": "date", "sortable": True, "align": "center"},
             {"name": "lesson", "label": "Урок", "field": "lesson", "align": "center"},
             {"name": "subject", "label": "Предмет", "field": "subject", "align": "left"},
             {"name": "student", "label": "Учень", "field": "student", "align": "left"},
@@ -1703,7 +2320,7 @@ class NitWebApp:
                     ui.badge(f"рядків: {len(self.excel_rows)}", color="secondary")
                     ui.badge("є дата" if self.excel_has_date else "без дати", color="green" if self.excel_has_date else "orange")
 
-            with ui.row().classes("w-full items-end gap-4"):
+            with ui.row().classes("responsive-controls w-full items-end gap-4"):
                 ui.select(
                     {
                         "homework": "Тільки домашні завдання",
@@ -1765,7 +2382,9 @@ class NitWebApp:
                 rows=self._import_rows(preview),
                 row_key="key",
                 pagination={"rowsPerPage": 15},
-            ).props("flat bordered wrap-cells").classes("w-full")
+            ).props("flat bordered wrap-cells").classes(
+                "nit-data-table import-data-table w-full"
+            )
 
     async def _excel_uploaded(self, event: Any) -> None:
         filename = str(event.file.name or "")
@@ -1939,7 +2558,7 @@ class NitWebApp:
     @staticmethod
     def _import_columns() -> list[dict[str, Any]]:
         return [
-            {"name": "date", "label": "Дата", "field": "date", "sortable": True},
+            {"name": "date", "label": "Дата", "field": "date", "sortable": True, "align": "center"},
             {"name": "lesson", "label": "Урок", "field": "lesson", "align": "center"},
             {"name": "old_topic", "label": "Тема НІТ", "field": "old_topic", "align": "left"},
             {"name": "new_topic", "label": "Тема Excel", "field": "new_topic", "align": "left"},
@@ -2173,7 +2792,9 @@ class NitWebApp:
                     rows=self._calendar_rows(selected_entries),
                     row_key="key",
                     pagination={"rowsPerPage": 0},
-                ).props("flat bordered hide-pagination wrap-cells").classes("calendar-detail-table w-full")
+                ).props("flat bordered hide-pagination wrap-cells").classes(
+                    "nit-data-table calendar-detail-table w-full"
+                )
             else:
                 ui.label("На цю дату уроків немає.").classes("text-slate-500")
 
@@ -2242,7 +2863,7 @@ class NitWebApp:
     @staticmethod
     def _calendar_columns() -> list[dict[str, Any]]:
         return [
-            {"name": "class", "label": "Клас", "field": "class", "sortable": True},
+            {"name": "class", "label": "Клас", "field": "class", "sortable": True, "align": "center"},
             {"name": "subject", "label": "Предмет", "field": "subject", "align": "left"},
             {"name": "lesson", "label": "Урок", "field": "lesson", "align": "center"},
             {"name": "topic", "label": "Тема", "field": "topic", "align": "left"},
@@ -2283,7 +2904,7 @@ class NitWebApp:
     @staticmethod
     def _lesson_columns() -> list[dict[str, Any]]:
         return [
-            {"name": "date", "label": "Дата", "field": "date", "sortable": True},
+            {"name": "date", "label": "Дата", "field": "date", "sortable": True, "align": "center"},
             {"name": "lesson", "label": "Урок", "field": "lesson", "align": "center"},
             {"name": "topic", "label": "Тема", "field": "topic", "align": "left"},
             {"name": "homework", "label": "Домашнє завдання", "field": "homework", "align": "left"},
@@ -2356,12 +2977,23 @@ def index() -> None:
 
 
 if __name__ in {"__main__", "__mp_main__"}:
+    host = os.getenv("NIT_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        port = int(os.getenv("NIT_PORT", "8080"))
+    except ValueError:
+        raise SystemExit("NIT_PORT має бути числом від 1 до 65535")
+    if not 1 <= port <= 65535:
+        raise SystemExit("NIT_PORT має бути числом від 1 до 65535")
+    show_browser = os.getenv("NIT_SHOW_BROWSER", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
     ui.run(
-        host="127.0.0.1",
-        port=8080,
+        host=host,
+        port=port,
         title="NIT² by FIZYK",
         favicon=Path(__file__).with_name("image.png"),
         dark=True,
-        show=True,
+        show=show_browser,
         reload=False,
+        storage_secret=_STORAGE_SECRET,
     )
