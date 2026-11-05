@@ -2277,7 +2277,7 @@ class NitWebApp:
                     "date": day.strftime("%d.%m.%Y") if day else "—",
                     "lesson": reminder.journal_day.get("lesson") or "—",
                     "subject": compact(reminder.journal.get("subject")) or "—",
-                    "student": f"…{reminder.user_id[-6:]}",
+                    "student": reminder.student_name or f"…{reminder.user_id[-6:]}",
                     "status": "Поставити «н»",
                 }
             )

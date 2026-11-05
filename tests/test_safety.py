@@ -13,7 +13,7 @@ from nit_core import (
     apply_absence_reminders,
     apply_import_preview,
 )
-from nit_homework_v2 import ExcelRow, PlannedChange
+from nit_homework_v2 import ExcelRow, PlannedChange, collect_absence_reminders
 
 
 def calendar_lesson(column: str, day: str, lesson: int) -> dict:
@@ -138,6 +138,31 @@ class AbsenceClient:
 
 
 class AbsenceSafetyTests(unittest.TestCase):
+    def test_reminder_contains_student_full_name(self):
+        class CollectionClient:
+            def get_journals(self, _schedule_id):
+                return [{
+                    "journalId": "j1",
+                    "className": "8-А",
+                    "classNumber": 8,
+                    "classLetter": "А",
+                    "subject": "Фізика",
+                }]
+
+            def get_journal_pages(self, _journal_id):
+                return [{
+                    "journalDay": [{"id": "c1", "date": "2026-09-03", "lesson": 3}],
+                    "marks": [],
+                    "absenceReminders": [{"journalDayId": "c1", "userId": "u1"}],
+                }]
+
+            def get_journal_users(self, _journal_id):
+                return [{"userId": "u1", "fullName": "Учень Тестовий"}]
+
+        reminders = collect_absence_reminders(CollectionClient(), {1: "schedule-1"})
+        self.assertEqual(len(reminders), 1)
+        self.assertEqual(reminders[0].student_name, "Учень Тестовий")
+
     def reminder(self):
         return AbsenceReminder(1, {"journalId": "j1", "className": "8-А", "subject": "Фізика"},
                                {"id": "c1", "date": "2026-09-03", "lesson": 3}, "u1")

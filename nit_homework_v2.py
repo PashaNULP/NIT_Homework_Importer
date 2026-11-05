@@ -144,6 +144,7 @@ class AbsenceReminder:
     journal: dict[str, Any]
     journal_day: dict[str, Any]
     user_id: str
+    student_name: str = ""
 
 
 def compact(s: Any) -> str:
@@ -1695,6 +1696,23 @@ def collect_absence_reminders(
                 continue
             print(f"  Нагадування: {journal['className']} — {journal['subject']}...", flush=True)
             pages = client.get_journal_pages(journal_id)
+            students = client.get_journal_users(journal_id)
+            student_names = {
+                compact(student.get("userId")): (
+                    compact(student.get("fullName"))
+                    or " ".join(
+                        part
+                        for part in (
+                            compact(student.get("lastName")),
+                            compact(student.get("firstName")),
+                            compact(student.get("middleName")),
+                        )
+                        if part
+                    )
+                )
+                for student in students
+                if compact(student.get("userId"))
+            }
 
             days_by_id: dict[str, dict[str, Any]] = {}
             existing_marks: set[tuple[str, str]] = set()
@@ -1731,7 +1749,15 @@ def collect_absence_reminders(
                         f"Журнал {journal['className']} — {journal['subject']}: "
                         f"для нагадування не знайдено колонку {journal_day_id}"
                     )
-                result.append(AbsenceReminder(semester, journal, journal_day, user_id))
+                result.append(
+                    AbsenceReminder(
+                        semester,
+                        journal,
+                        journal_day,
+                        user_id,
+                        student_names.get(user_id, ""),
+                    )
+                )
 
     result.sort(
         key=lambda item: (
