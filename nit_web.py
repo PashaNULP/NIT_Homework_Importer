@@ -2971,6 +2971,12 @@ class NitWebApp:
         self._notify(message, type="negative", timeout=8000, close_button=True)
 
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    """Легка локальна перевірка для Windows-лаунчера та моніторингу."""
+    return {"status": "ok", "app": "NIT2"}
+
+
 @ui.page("/")
 def index() -> None:
     NitWebApp()

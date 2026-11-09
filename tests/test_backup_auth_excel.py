@@ -204,6 +204,11 @@ class RegressionTests(unittest.TestCase):
     def test_modules_import(self):
         __import__("nit_core"); __import__("nit_web"); __import__("nit_homework_v2"); __import__("nit_schedule")
 
+    def test_web_health_payload(self):
+        import nit_web
+
+        self.assertEqual(nit_web.health(), {"status": "ok", "app": "NIT2"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,8 +32,9 @@ if errorlevel 1 goto :error
 if not exist nit_config.local.json copy /Y nit_config.example.json nit_config.local.json >nul
 
 echo.
-echo Готово. Вкажіть school_id у файлі nit_config.local.json,
+echo Готово. Перевірте school_id у файлі nit_config.local.json,
 echo а потім запускайте "Запустити NIT Windows.bat".
+echo Для постійної роботи можна окремо увімкнути автозапуск.
 pause
 exit /b 0
 
