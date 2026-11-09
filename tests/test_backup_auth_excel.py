@@ -209,6 +209,33 @@ class RegressionTests(unittest.TestCase):
 
         self.assertEqual(nit_web.health(), {"status": "ok", "app": "NIT2"})
 
+    def test_web_tls_options_require_both_files(self):
+        import nit_web
+
+        with patch.dict(os.environ, {"NIT_SSL_CERTFILE": "cert.pem"}, clear=True):
+            with self.assertRaisesRegex(SystemExit, "NIT_SSL_CERTFILE і NIT_SSL_KEYFILE"):
+                nit_web._tls_run_options()
+
+    def test_web_tls_options_accept_existing_files(self):
+        import nit_web
+
+        with tempfile.TemporaryDirectory() as directory:
+            cert = Path(directory) / "cert.pem"
+            key = Path(directory) / "key.pem"
+            cert.touch()
+            key.touch()
+            with patch.dict(
+                os.environ,
+                {"NIT_SSL_CERTFILE": str(cert), "NIT_SSL_KEYFILE": str(key)},
+                clear=True,
+            ):
+                options, enabled = nit_web._tls_run_options()
+        self.assertTrue(enabled)
+        self.assertEqual(
+            options,
+            {"ssl_certfile": str(cert.resolve()), "ssl_keyfile": str(key.resolve())},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

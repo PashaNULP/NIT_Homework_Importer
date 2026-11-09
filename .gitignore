@@ -14,6 +14,7 @@ nit_*backup*.json
 *.log
 Pasted text.txt
 nit_config.local.json
+NIT2-CA.cer
 *.session.json
 розклад_усіх_вчителів_*.json
 .env

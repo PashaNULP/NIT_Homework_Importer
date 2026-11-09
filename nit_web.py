@@ -2982,6 +2982,26 @@ def index() -> None:
     NitWebApp()
 
 
+def _tls_run_options() -> tuple[dict[str, str], bool]:
+    """Повернути SSL-параметри NiceGUI, якщо локальний HTTPS налаштований."""
+    cert_value = os.getenv("NIT_SSL_CERTFILE", "").strip()
+    key_value = os.getenv("NIT_SSL_KEYFILE", "").strip()
+    if bool(cert_value) != bool(key_value):
+        raise SystemExit("Для HTTPS потрібно вказати NIT_SSL_CERTFILE і NIT_SSL_KEYFILE разом")
+    if not cert_value:
+        return {}, False
+    cert_path = Path(cert_value).expanduser().resolve()
+    key_path = Path(key_value).expanduser().resolve()
+    if not cert_path.is_file():
+        raise SystemExit(f"Не знайдено HTTPS-сертифікат: {cert_path}")
+    if not key_path.is_file():
+        raise SystemExit(f"Не знайдено приватний ключ HTTPS: {key_path}")
+    return {
+        "ssl_certfile": str(cert_path),
+        "ssl_keyfile": str(key_path),
+    }, True
+
+
 if __name__ in {"__main__", "__mp_main__"}:
     host = os.getenv("NIT_HOST", "127.0.0.1").strip() or "127.0.0.1"
     try:
@@ -2993,6 +3013,7 @@ if __name__ in {"__main__", "__mp_main__"}:
     show_browser = os.getenv("NIT_SHOW_BROWSER", "1").strip().lower() not in {
         "0", "false", "no", "off",
     }
+    tls_options, tls_enabled = _tls_run_options()
     ui.run(
         host=host,
         port=port,
@@ -3002,4 +3023,6 @@ if __name__ in {"__main__", "__mp_main__"}:
         show=show_browser,
         reload=False,
         storage_secret=_STORAGE_SECRET,
+        session_middleware_kwargs={"https_only": tls_enabled, "same_site": "lax"},
+        **tls_options,
     )
